@@ -197,24 +197,39 @@ async function a11yAlive() {
   return !!(r && r.ok === true);
 }
 
+/**
+ * 重新绑定无障碍服务。
+ *
+ * ⚠️ 两个踩过的坑（v1.1.0 的自愈失效就是这两个）：
+ *   ① 把多行脚本用 `; ` 拼成一行时，`if ...; then; ...` 里的 `then;` 是 **shell 语法错误**
+ *      （`syntax error: unexpected ';'`），整条命令直接不执行；
+ *   ② 这台机器的 `tr` 是 **toybox 版，不支持 `\n` 转义**：`tr : '\n'` 会把冒号换成**反斜杠**，
+ *      于是 `grep -v` 之后列表为空 —— 差点把用户其他无障碍服务一并删掉。
+ *
+ * 结论：**字符串处理放 JS 侧，shell 只执行最简单的单条命令**。
+ */
 async function rebindA11y() {
-  const cmd = [
-    'CUR=$(settings get secure enabled_accessibility_services)',
-    'if echo "$CUR" | grep -q "com.deepseek.harness"; then',
-    '  W=$(echo "$CUR" | tr ":" "\\n" | grep -v "com.deepseek.harness" | tr "\\n" ":" | sed "s/:$//")',
-    '  settings put secure enabled_accessibility_services "$W"',
-    '  sleep 1',
-    '  settings put secure enabled_accessibility_services "$CUR"',
-    'else',
-    '  settings put secure enabled_accessibility_services "${CUR}:com.deepseek.harness/.AccessibilityService"',
-    'fi',
-    'settings put secure accessibility_enabled 1',
-    'echo rebound-ok'
-  ].join("; ");
-  const r = await appShell(cmd, 20000);
-  if (!r || typeof r.exit_code !== "number" || r.exit_code !== 0) return false;
+  const SVC = "com.deepseek.harness/.AccessibilityService";
+  const okNum = (r) => !!(r && typeof r.exit_code === "number" && r.exit_code === 0);
+
+  // 1) 读当前列表
+  const r1 = await appShell("settings get secure enabled_accessibility_services", 15000);
+  if (!okNum(r1)) return false;
+  const cur = String(r1.stdout || "").trim();
+
+  // 2) 过滤（JS 侧，避免 shell 的 tr/sed 兼容性坑）
+  const keep = cur.split(":").map((s) => s.trim())
+    .filter((s) => s && !s.includes("com.deepseek.harness"));
+  const without = keep.join(":");
+  const full = (without ? without + ":" : "") + SVC;
+
+  // 3) toggle：先摘掉再写回含它的完整列表，才会触发系统重新绑定
+  const a = await appShell(`settings put secure enabled_accessibility_services '${without}'`, 15000);
+  await sleep(1200);
+  const b = await appShell(`settings put secure enabled_accessibility_services '${full}'`, 15000);
+  const c = await appShell("settings put secure accessibility_enabled 1", 15000);
   await sleep(2500);
-  return true;
+  return okNum(a) && okNum(b) && okNum(c);
 }
 
 /* ────────────────────────── 插件主体 ────────────────────────── */

@@ -186,6 +186,37 @@ const OUTPUT = {
 const out = (text) => ({ ok: true, text });
 const fail = (error) => ({ ok: false, error });
 
+/* ────────────────────────── 无障碍服务保活 ────────────────────────── */
+/**
+ * ColorOS 等激进省电系统会杀掉无障碍服务进程，但**保留开关状态**，
+ * 此时 3181 端口拒绝连接。必须把该服务从 enabled_accessibility_services
+ * 里移除再写回（toggle）才会触发系统重新绑定。
+ */
+async function a11yAlive() {
+  const r = await a11y("/status", undefined, 4000);
+  return !!(r && r.ok === true);
+}
+
+async function rebindA11y() {
+  const cmd = [
+    'CUR=$(settings get secure enabled_accessibility_services)',
+    'if echo "$CUR" | grep -q "com.deepseek.harness"; then',
+    '  W=$(echo "$CUR" | tr ":" "\\n" | grep -v "com.deepseek.harness" | tr "\\n" ":" | sed "s/:$//")',
+    '  settings put secure enabled_accessibility_services "$W"',
+    '  sleep 1',
+    '  settings put secure enabled_accessibility_services "$CUR"',
+    'else',
+    '  settings put secure enabled_accessibility_services "${CUR}:com.deepseek.harness/.AccessibilityService"',
+    'fi',
+    'settings put secure accessibility_enabled 1',
+    'echo rebound-ok'
+  ].join("; ");
+  const r = await appShell(cmd, 20000);
+  if (!r || typeof r.exit_code !== "number" || r.exit_code !== 0) return false;
+  await sleep(2500);
+  return true;
+}
+
 /* ────────────────────────── 插件主体 ────────────────────────── */
 function apply(ctx) {
   // 1) 紧凑读屏
@@ -395,6 +426,45 @@ function apply(ctx) {
       return out(parts.join("\n"));
     }
   }));
+
+  // 6) 无障碍服务自检/自愈（手动触发；插件本身每 30 秒也会自动跑一次）
+  ctx.tools.register(defineTool({
+    name: "ops_a11y_ensure",
+    description: "检查无障碍服务（屏幕助手）是否真的活着；不活就自动重新绑定。" +
+      "ColorOS 常杀掉无障碍进程但保留开关，此时 ops_ui_* 会报 ECONNREFUSED 127.0.0.1:3181。" +
+      "插件后台每 30 秒会自己检查一次，这个工具用来立即手动触发。",
+    parameters: {},
+    output: OUTPUT,
+    async execute() {
+      if (await a11yAlive()) return out("无障碍服务正常。");
+      const ok = await rebindA11y();
+      if (ok && (await a11yAlive())) return out("无障碍服务原本不可用，已自动重新绑定并恢复。");
+      return fail("无障碍服务不可用，自动重绑失败。请手动到 设置 → 无障碍 关闭再开启「DeepSeek Harness 屏幕助手」。");
+    }
+  }));
+
+  // 后台保活：每 30 秒探一次，连续 2 次失败才动手，60 秒冷却，避免抖动与惊群。
+  let failStreak = 0, busy = false, lastRebind = 0;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      if (await a11yAlive()) { failStreak = 0; return; }
+      failStreak += 1;
+      if (failStreak < 2) return;
+      if (Date.now() - lastRebind < 60000) return;
+      lastRebind = Date.now();
+      if (await rebindA11y() && await a11yAlive()) failStreak = 0;
+    } catch (_) {
+      /* 保活失败不抛，静默重试 */
+    } finally {
+      busy = false;
+    }
+  }, 30000);
+  if (timer && typeof timer.unref === "function") timer.unref();
+  if (typeof ctx.on === "function") {
+    try { ctx.on("dispose", () => clearInterval(timer)); } catch (_) {}
+  }
 }
 
 export { name, inject, apply };

@@ -1,0 +1,14 @@
+# dsh-ops-android
+#
+# 参考 T-Auto/dsh-ops 的核心理念（减少 token 消耗、减少往返、渐进式披露），
+# 但按 Android 手机的特点重造，而不是移植 Windows 组件：
+#
+#   1. 减少往返：ops_ui_find 把「读屏 → 定位 → 点击/输入」压成一次调用
+#   2. 压缩输出：ops_ui_digest 只列可交互元素，用短分数坐标、单行一个、默认分页
+#   3. 消除轮询：ops_ui_wait 在插件内部轮询，命中才返回
+#   4. 批量执行：ops_ui_seq 一次跑一串 UI 步骤；ops_shell 一次跑一批特权命令
+#
+# 通道：无障碍服务(APP_A11Y_PORT, 默认 3181) + App 特权服务(APP_NOTIFY_PORT, 默认 3081)
+- insert:
+    - id: ops-android
+      name: 'dsh-ops-android'

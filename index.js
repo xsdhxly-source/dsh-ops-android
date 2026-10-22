@@ -1,22 +1,67 @@
 /**
- * dsh-ops-android —— 为 Android 手机端 DSH 打造的「省 token 操作原语」。
+ * dsh-ops-android v2.0.0 —— 为 Android 手机端 DSH 打造的「省 token 操作原语」。
  *
- * 设计思路（借用 dsh-ops 的核心理念，按手机特点重造，而非移植）：
+ * 设计思路（借用 dsh-ops 的核心理念，按手机特点重造）：
  *   1. 减少往返：把「读屏 → 找坐标 → 点击」压成一次调用（ops_ui_find）
  *   2. 压缩输出：控件树只给可交互元素 + 分数坐标 + 单行紧凑格式（ops_ui_digest）
  *   3. 消除轮询：等待条件在插件内部轮询，命中才返回（ops_ui_wait）
- *   4. 批量执行：一串操作一次提交，只回最终状态（ops_ui_seq / ops_shell）
+ *   4. 批量执行：一串操作一次提交（ops_ui_seq / ops_shell）
+ *
+ * v2.0.0 两大核心变化：
+ *   - 双状态特权通道：
+ *       root 态（越狱）：直接走自定义 su 命令，不依赖 Shizuku
+ *       shizuku 态（坐牢）：走 App 内 /shell 通道（3081）
+ *     mode 可强制指定，auto 模式按「root 优先 → Shizuku 兜底」探测。
+ *   - 屏幕尺寸：自动检测（wm size）+ 手动覆盖，手动值永远优先；
+ *     自动检测失败时明确要求填手动值，不再拿 1440x3200 蒙混。
  *
  * 通道：
- *   - 无障碍 App 本地服务：APP_A11Y_PORT，默认 3181（/dump /tap /input /scroll /hold /swipe /screenshot）
- *   - App 特权服务：APP_NOTIFY_PORT，默认 3081（/shell）
+ *   - 无障碍 App 本地服务：APP_A11Y_PORT，默认 3181
+ *   - App 特权服务：APP_NOTIFY_PORT，默认 3081（/shell，uid=shell）
  * 鉴权：X-DSH-Token: APP_LOCAL_TOKEN（App 启动引擎时注入）
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import z from "@deepseek-ai/schemastery";
 import { get as httpGet, request as httpRequest } from "node:http";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
-const name = "ops-android";
-const inject = ["tools"];
+export const name = "ops-android";
+export const inject = ["tools"];
+
+/* ────────────────────────── 配置 ────────────────────────── */
+export const Config = z.object({
+  mode: z.string().default("auto"),
+  suCommand: z.string().default("su -c"),
+  screenWidth: z.number().default(0),
+  screenHeight: z.number().default(0),
+  a11yAutoHeal: z.boolean().default(false),
+  commandTimeoutMs: z.number().default(30000),
+});
+
+const MODES = new Set(["auto", "root", "shizuku"]);
+
+let CFG = {
+  mode: "auto",
+  suCommand: "su -c",
+  screenWidth: 0,
+  screenHeight: 0,
+  a11yAutoHeal: false,
+  commandTimeoutMs: 30000,
+};
+
+function resolveConfig(config) {
+  const c = config && typeof config === "object" ? config : {};
+  const mode = MODES.has(String(c.mode)) ? String(c.mode) : "auto";
+  return {
+    mode,
+    suCommand: String(c.suCommand || "su -c"),
+    screenWidth: Math.max(0, Number(c.screenWidth) || 0),
+    screenHeight: Math.max(0, Number(c.screenHeight) || 0),
+    a11yAutoHeal: c.a11yAutoHeal === true,
+    commandTimeoutMs: Math.max(1000, Number(c.commandTimeoutMs) || 30000),
+  };
+}
 
 const a11yPort = () => parseInt(process.env.APP_A11Y_PORT || "3181", 10);
 const appPort = () => parseInt(process.env.APP_NOTIFY_PORT || "3081", 10);
@@ -24,7 +69,7 @@ const token = () => process.env.APP_LOCAL_TOKEN || "";
 
 const GUIDE = "无障碍服务不可用：请到 设置 → 无障碍 → 开启「DeepSeek Harness 屏幕助手」";
 
-/** 统一的本地 HTTP 调用（自动带鉴权头、JSON 解析、超时兜底）。 */
+/* ────────────────────────── 本地 HTTP ────────────────────────── */
 function call(method, port, path, opts = {}) {
   const { params, body, timeoutMs } = opts;
   return new Promise((resolve) => {
@@ -62,20 +107,133 @@ function call(method, port, path, opts = {}) {
 }
 
 const a11y = (path, params, timeoutMs) => call("GET", a11yPort(), path, { params, timeoutMs });
-const a11yPost = (path, body, timeoutMs) => call("POST", a11yPort(), path, { body, timeoutMs });
-const appShell = (command, timeoutMs) =>
-  call("POST", appPort(), "/shell", { body: { command, timeout_ms: timeoutMs || 30000, token: token() }, timeoutMs: (timeoutMs || 30000) + 10000 });
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* ────────────────────────── 屏幕尺寸（缓存） ────────────────────────── */
+/* ────────────────────────── 进程执行（root 通道） ────────────────────────── */
+function runProc(bin, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let stdout = "", stderr = "", settled = false, timer = null;
+    let p;
+    try { p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { return resolve({ ok: false, error: "spawn 失败: " + String(e && e.message || e) }); }
+    const finish = (v) => { if (!settled) { settled = true; if (timer) clearTimeout(timer); resolve(v); } };
+    timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch (_) {} finish({ ok: false, error: "命令超时（" + timeoutMs + "ms）" }); }, timeoutMs);
+    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 1048576) stdout = stdout.slice(0, 1048576); });
+    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 262144) stderr = stderr.slice(0, 262144); });
+    p.on("error", (e) => finish({ ok: false, error: "执行失败: " + String(e && e.message || e), stdout, stderr }));
+    p.on("close", (code) => finish({ ok: true, exit_code: typeof code === "number" ? code : -1, stdout, stderr }));
+  });
+}
+
+function quoteCmd(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
+/** 用配置里的 suCommand 执行；支持 {cmd} 占位符，否则视为二进制前缀（如 "su -c"）。 */
+async function runAsRoot(cmd, timeoutMs) {
+  const tmpl = String(CFG.suCommand || "su -c").trim();
+  const full = tmpl.includes("{cmd}") ? tmpl.replace(/\{cmd\}/g, quoteCmd(cmd)) : tmpl + " " + quoteCmd(cmd);
+  return runProc("/system/bin/sh", ["-c", full], timeoutMs);
+}
+
+async function runAsShizuku(cmd, timeoutMs) {
+  return call("POST", appPort(), "/shell", {
+    body: { command: cmd, timeout_ms: timeoutMs, token: token() },
+    timeoutMs: (timeoutMs || 30000) + 10000,
+  });
+}
+
+/* ────────────────────────── 通道状态与选择 ────────────────────────── */
+const STATE = { root: null, shizuku: null, probedAt: 0 };
+
+function normRoot(r) {
+  if (!r) return { ok: false, error: "root 无响应" };
+  if (r.ok && r.exit_code === 0) return { ok: true, exit_code: 0, stdout: r.stdout || "", stderr: r.stderr || "" };
+  const err = r.error || r.stderr || ("exit=" + r.exit_code);
+  return { ok: false, error: String(err).trim() || "root 执行失败" };
+}
+
+function normShizuku(r) {
+  if (!r) return { ok: false, error: "Shizuku 无响应" };
+  if (typeof r.exit_code === "number") {
+    return {
+      ok: r.exit_code === 0,
+      exit_code: r.exit_code,
+      stdout: r.stdout || "",
+      stderr: r.stderr || "",
+      error: r.exit_code === 0 ? undefined : String(r.stderr || r.error || ("exit=" + r.exit_code)).trim(),
+    };
+  }
+  return { ok: false, error: String(r.error || "Shizuku 不可用") };
+}
+
+async function probeRoot() {
+  const r = await runAsRoot("id", 8000);
+  const ok = !!(r && r.ok && r.exit_code === 0 && /\buid=0\b/.test(String(r.stdout || "")));
+  STATE.root = ok;
+  STATE.probedAt = Date.now();
+  return ok;
+}
+
+async function probeShizuku() {
+  const r = normShizuku(await runAsShizuku("id", 8000));
+  STATE.shizuku = r.ok;
+  STATE.probedAt = Date.now();
+  return r.ok;
+}
+
+/**
+ * 统一特权执行：
+ *   mode=root     只走 root，失败直接报错
+ *   mode=shizuku  只走 /shell
+ *   mode=auto     root 优先，失败自动降级 Shizuku，再失败回 root 兜底
+ */
+async function privileged(cmd, timeoutMs) {
+  const tmo = Math.max(1000, Number(timeoutMs) || CFG.commandTimeoutMs);
+  const mode = CFG.mode;
+
+  if (mode === "root") return normRoot(await runAsRoot(cmd, tmo));
+  if (mode === "shizuku") return normShizuku(await runAsShizuku(cmd, tmo));
+
+  if (STATE.root === null) await probeRoot();
+  let rootErr = "";
+  if (STATE.root === true) {
+    const r = normRoot(await runAsRoot(cmd, tmo));
+    if (r.ok) return r;
+    rootErr = r.error || "";
+    STATE.root = false;
+  }
+  const s = normShizuku(await runAsShizuku(cmd, tmo));
+  if (s.ok) { STATE.shizuku = true; return s; }
+  STATE.shizuku = false;
+  const r2 = normRoot(await runAsRoot(cmd, tmo));
+  if (r2.ok) { STATE.root = true; return r2; }
+  return {
+    ok: false,
+    error: `两条特权通道都不可用。root: ${rootErr || r2.error || "-"}；shizuku: ${s.error || "-"}`,
+    hint: "越狱态请先跑 GhostLock；坐牢态请启动 Shizuku。",
+  };
+}
+
+/* ────────────────────────── 屏幕尺寸（手动 > 自动） ────────────────────────── */
 let SCREEN = null;
+
 async function screenSize() {
+  if (CFG.screenWidth > 0 && CFG.screenHeight > 0) {
+    return { w: CFG.screenWidth, h: CFG.screenHeight, source: "manual" };
+  }
   if (SCREEN) return SCREEN;
-  const r = await appShell("wm size", 10000);
-  const m = /(\d+)\s*x\s*(\d+)/.exec(String((r && r.stdout) || ""));
-  SCREEN = m ? { w: Number(m[1]), h: Number(m[2]) } : { w: 1440, h: 3200 };
-  return SCREEN;
+  const r = await privileged("wm size", 10000);
+  if (r.ok) {
+    const m = /(\d+)\s*x\s*(\d+)/.exec(String(r.stdout || ""));
+    if (m) {
+      SCREEN = { w: Number(m[1]), h: Number(m[2]), source: "auto" };
+      return SCREEN;
+    }
+  }
+  return null;
+}
+
+function screenHint() {
+  return "自动检测失败：请在插件配置里手动填写 screenWidth / screenHeight（手动值优先于自动值，填一次永久生效）。";
 }
 
 /* ────────────────────────── 读屏 ────────────────────────── */
@@ -94,10 +252,6 @@ function toRe(s) {
 
 const label = (n) => ((n.text || "").trim() || (n.desc || "").trim() || String(n.cls || "").split(".").pop() || "?").replace(/\s+/g, " ");
 
-/**
- * 紧凑化：过滤 → 去重 → 视觉排序 → 截断。
- * 只输出「可交互或有文字」的节点，坐标换成 0~1 分数（短且免疫截图缩放）。
- */
 function compact(nodes, pkg, scr, opt = {}) {
   const { match, all = false, limit = 25 } = opt;
   const re = match ? toRe(match) : null;
@@ -127,7 +281,8 @@ function compact(nodes, pkg, scr, opt = {}) {
       + (n.selected ? "*" : "") + (n.checked ? "+" : "");
     return `${i} ${label(n).slice(0, 36)} @${fx},${fy}${f ? " " + f : ""}`;
   });
-  const head = `${pkg || "?"} ${shown.length}/${total}${total > shown.length ? " (+" + (total - shown.length) + " 未显示)" : ""}`;
+  const src = scr && scr.source === "manual" ? " 手动尺寸" : "";
+  const head = `${pkg || "?"} ${shown.length}/${total}${total > shown.length ? " (+" + (total - shown.length) + " 未显示)" : ""}${src}`;
   return { total, shown: shown.length, text: [head, ...lines].join("\n"), nodes: shown };
 }
 
@@ -135,6 +290,7 @@ async function digestText(opt) {
   const d = await dump();
   if (!d.ok) return { ok: false, error: d.error };
   const scr = await screenSize();
+  if (!scr) return { ok: false, error: screenHint() };
   const c = compact(d.nodes, d.package, scr, opt);
   if (!c.total) return { ok: true, text: `${d.package || "?"} 0/? —— 没有匹配的可交互元素` };
   return { ok: true, text: c.text };
@@ -156,8 +312,8 @@ async function doInput(text, paste) {
 }
 
 async function doKey(code) {
-  const r = await appShell(`input keyevent ${code}`, 12000);
-  return r && typeof r.exit_code === "number" && r.exit_code === 0 ? { ok: true } : { ok: false, error: (r && (r.error || r.stderr)) || "按键失败" };
+  const r = await privileged(`input keyevent ${code}`, 12000);
+  return r.ok ? { ok: true } : { ok: false, error: r.error || "按键失败" };
 }
 
 const findNode = (nodes, match) => {
@@ -167,7 +323,7 @@ const findNode = (nodes, match) => {
   return hit[0] || null;
 };
 
-/* ────────────────────────── 输出 schema（所有工具共用） ────────────────────────── */
+/* ────────────────────────── 输出 schema ────────────────────────── */
 const OUTPUT = {
   schema: {
     type: "object",
@@ -186,54 +342,95 @@ const OUTPUT = {
 const out = (text) => ({ ok: true, text });
 const fail = (error) => ({ ok: false, error });
 
-/* ────────────────────────── 无障碍服务保活 ────────────────────────── */
-/**
- * ColorOS 等激进省电系统会杀掉无障碍服务进程，但**保留开关状态**，
- * 此时 3181 端口拒绝连接。必须把该服务从 enabled_accessibility_services
- * 里移除再写回（toggle）才会触发系统重新绑定。
- */
+/* ────────────────────────── 无障碍自愈（仅手动，需特权通道） ────────────────────────── */
 async function a11yAlive() {
   const r = await a11y("/status", undefined, 4000);
   return !!(r && r.ok === true);
 }
 
 /**
- * 重新绑定无障碍服务。
- *
- * ⚠️ 两个踩过的坑（v1.1.0 的自愈失效就是这两个）：
- *   ① 把多行脚本用 `; ` 拼成一行时，`if ...; then; ...` 里的 `then;` 是 **shell 语法错误**
- *      （`syntax error: unexpected ';'`），整条命令直接不执行；
- *   ② 这台机器的 `tr` 是 **toybox 版，不支持 `\n` 转义**：`tr : '\n'` 会把冒号换成**反斜杠**，
- *      于是 `grep -v` 之后列表为空 —— 差点把用户其他无障碍服务一并删掉。
- *
- * 结论：**字符串处理放 JS 侧，shell 只执行最简单的单条命令**。
+ * 重新绑定无障碍服务。前提：必须有可用特权通道（Shizuku 或 root）。
+ * 不做开机自启/后台保活 —— 重启后 Shizuku 与临时 root 都会消失，开机保活没有意义。
  */
 async function rebindA11y() {
+  const route = await privileged("id", 8000);
+  if (!route.ok) {
+    return { ok: false, error: "自愈需要特权通道（Shizuku 或 root），当前两者都不可用：" + (route.error || "") + "。请先启动 Shizuku，或重新越狱。" };
+  }
   const SVC = "com.deepseek.harness/.AccessibilityService";
-  const okNum = (r) => !!(r && typeof r.exit_code === "number" && r.exit_code === 0);
-
-  // 1) 读当前列表
-  const r1 = await appShell("settings get secure enabled_accessibility_services", 15000);
-  if (!okNum(r1)) return false;
+  const r1 = await privileged("settings get secure enabled_accessibility_services", 15000);
+  if (!r1.ok) return { ok: false, error: "读取无障碍列表失败：" + (r1.error || "") };
   const cur = String(r1.stdout || "").trim();
-
-  // 2) 过滤（JS 侧，避免 shell 的 tr/sed 兼容性坑）
-  const keep = cur.split(":").map((s) => s.trim())
-    .filter((s) => s && !s.includes("com.deepseek.harness"));
+  const keep = cur.split(":").map((s) => s.trim()).filter((s) => s && !s.includes("com.deepseek.harness"));
   const without = keep.join(":");
   const full = (without ? without + ":" : "") + SVC;
 
-  // 3) toggle：先摘掉再写回含它的完整列表，才会触发系统重新绑定
-  const a = await appShell(`settings put secure enabled_accessibility_services '${without}'`, 15000);
+  const a = await privileged(`settings put secure enabled_accessibility_services '${without}'`, 15000);
   await sleep(1200);
-  const b = await appShell(`settings put secure enabled_accessibility_services '${full}'`, 15000);
-  const c = await appShell("settings put secure accessibility_enabled 1", 15000);
+  const b = await privileged(`settings put secure enabled_accessibility_services '${full}'`, 15000);
+  const c = await privileged("settings put secure accessibility_enabled 1", 15000);
   await sleep(2500);
-  return okNum(a) && okNum(b) && okNum(c);
+  if (a.ok && b.ok && c.ok) return { ok: true };
+  return { ok: false, error: "写入无障碍设置失败：" + [a.error, b.error, c.error].filter(Boolean).join(" / ") };
+}
+
+/* ────────────────────────── 环境自检 ────────────────────────── */
+let CURRENT_CTX = null;
+
+async function envReport() {
+  const lines = [];
+
+  lines.push("【命令行环境】");
+  lines.push(`  node=${process.version} platform=${process.platform} arch=${process.arch}`);
+  lines.push(`  shell=/system/bin/sh ${existsSync("/system/bin/sh") ? "存在" : "缺失"}`);
+  const pathStr = String(process.env.PATH || "");
+  lines.push(`  PATH=${pathStr ? pathStr.slice(0, 180) : "(空)"}`);
+
+  lines.push("【权限环境】");
+  const rootOk = await probeRoot();
+  const shzOk = await probeShizuku();
+  lines.push(`  root: ${rootOk ? "可用（越狱态）" : "不可用（坐牢态）"}  suCommand=${CFG.suCommand}`);
+  lines.push(`  shizuku: ${shzOk ? "可用（/shell " + appPort() + "）" : "不可用"}`);
+  lines.push(`  当前模式: ${CFG.mode}${CFG.mode === "auto" ? "（root 优先，Shizuku 兜底）" : ""}`);
+
+  lines.push("【工具环境】");
+  lines.push("  本插件: ops_ui_digest / ops_ui_find / ops_ui_wait / ops_ui_seq / ops_shell / ops_a11y_ensure / ops_env");
+  try {
+    if (CURRENT_CTX && CURRENT_CTX.tools && typeof CURRENT_CTX.tools.schemas === "function") {
+      const s = CURRENT_CTX.tools.schemas();
+      const names = Array.isArray(s) ? s.map((x) => x && x.name).filter(Boolean) : Object.keys(s || {});
+      if (names.length) lines.push(`  dsh 可见工具（${names.length}）: ${names.join(", ")}`);
+    }
+  } catch (_) { /* 拿不到工具表时静默 */ }
+
+  lines.push("【系统环境】");
+  const sys = await privileged(
+    "getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.model; " +
+    "getprop ro.build.security_patch; getenforce", 15000);
+  if (sys.ok) {
+    const arr = String(sys.stdout || "").split("\n");
+    lines.push(`  Android ${(arr[0] || "?").trim()} (SDK ${(arr[1] || "?").trim()}) | ${(arr[2] || "?").trim()}`);
+    lines.push(`  安全补丁 ${(arr[3] || "?").trim()} | SELinux ${(arr[4] || "?").trim()}`);
+  } else {
+    lines.push(`  系统信息不可用：${sys.error || "未知"}`);
+  }
+  const scr = await screenSize();
+  lines.push(`  屏幕: ${scr ? `${scr.w}x${scr.h}（${scr.source === "manual" ? "手动" : "自动"}）` : "自动检测失败，请手动填写 screenWidth/screenHeight"}`);
+  const a = await a11y("/status", undefined, 4000);
+  lines.push(`  无障碍: ${a && a.ok ? "运行中" : "不可用"}`);
+  if (a && a.ok && a.package) lines.push(`  前台应用: ${a.package}`);
+
+  return lines.join("\n");
 }
 
 /* ────────────────────────── 插件主体 ────────────────────────── */
-function apply(ctx) {
+function apply(ctx, config) {
+  CFG = resolveConfig(config);
+  CURRENT_CTX = ctx;
+  SCREEN = null;
+  STATE.root = null;
+  STATE.shizuku = null;
+
   // 1) 紧凑读屏
   ctx.tools.register(defineTool({
     name: "ops_ui_digest",
@@ -255,7 +452,7 @@ function apply(ctx) {
     }
   }));
 
-  // 2) 找 + 直接动作（省掉一轮往返）
+  // 2) 找 + 直接动作
   ctx.tools.register(defineTool({
     name: "ops_ui_find",
     description: "在屏幕上按文字/描述查找元素，并可**直接执行动作**（tap/input/hold/none），一步完成" +
@@ -276,6 +473,7 @@ function apply(ctx) {
       const n = findNode(d.nodes, match);
       if (!n) {
         const scr = await screenSize();
+        if (!scr) return fail(screenHint());
         const c = compact(d.nodes, d.package, scr, { limit: 12 });
         return fail(`没找到「${match}」。当前界面：\n${c.text}`);
       }
@@ -296,7 +494,7 @@ function apply(ctx) {
     }
   }));
 
-  // 3) 等待条件（插件内轮询，外面只等一次）
+  // 3) 等待条件
   ctx.tools.register(defineTool({
     name: "ops_ui_wait",
     description: "等待某个文字出现（或消失），在插件内部轮询，命中即返回，省掉反复读屏的往返。" +
@@ -327,12 +525,13 @@ function apply(ctx) {
         await sleep(interval);
       }
       const scr = await screenSize();
+      if (!scr) return fail(screenHint());
       const c = compact((last && last.nodes) || [], (last && last.package) || "", scr, { limit: 12 });
       return fail(`等待「${match}」${absent ? "消失" : "出现"}超时（${timeout}ms）。当前界面：\n${c.text}`);
     }
   }));
 
-  // 4) 批量步骤（把 N 轮压成 1 轮）
+  // 4) 批量步骤
   ctx.tools.register(defineTool({
     name: "ops_ui_seq",
     description: "一次提交一串 UI 操作并按序执行，只回最终状态，把 5~10 轮工具往返压成 1 轮。" +
@@ -412,74 +611,70 @@ function apply(ctx) {
         const d = await dump();
         if (d.ok) {
           const scr = await screenSize();
-          lines.push("", compact(d.nodes, d.package, scr, { limit: 15 }).text);
+          if (scr) lines.push("", compact(d.nodes, d.package, scr, { limit: 15 }).text);
         }
       }
       return out(lines.join("\n"));
     }
   }));
 
-  // 5) 批量 shell（一次多条命令，只回必要输出）
+  // 5) 批量特权 shell（双状态通道）
   ctx.tools.register(defineTool({
     name: "ops_shell",
-    description: "一次执行一批特权 shell 命令（走 App 内 /shell 通道，uid=shell），多条命令用 ';' 或换行连接，" +
-      "只回 stdout/stderr 与退出码。用于把多次 shizuku_shell 往返压成一次。",
+    description: "执行特权 shell 命令，按插件 mode 选择通道：root 态走自定义 su 命令（默认 su -c），" +
+      "坐牢态走 App 内 /shell（Shizuku，uid=shell），auto 模式 root 优先、Shizuku 兜底。" +
+      "多条命令用 ';' 或换行连接。返回 stdout/stderr 与退出码。",
     parameters: {
       command: { type: "string", description: "要执行的命令（可含多条，用 ; 或换行分隔）" },
-      timeout_ms: { type: "number", description: "超时毫秒，默认 30000" }
+      timeout_ms: { type: "number", description: "超时毫秒，默认取插件配置 commandTimeoutMs" }
     },
     output: OUTPUT,
     async execute(args) {
       const cmd = String(args.command || "").trim();
       if (!cmd) return fail("ops_shell 需要 command 参数");
-      const r = await appShell(cmd, Math.max(1000, Math.min(120000, Number(args.timeout_ms) || 30000)));
-      if (!r || typeof r.exit_code !== "number") return fail((r && r.error) || "特权通道不可用");
+      const timeout = Math.max(1000, Math.min(120000, Number(args.timeout_ms) || CFG.commandTimeoutMs));
+      const r = await privileged(cmd, timeout);
+      if (!r.ok) {
+        return fail((r.error || "特权通道不可用") + (r.hint ? "\n提示：" + r.hint : ""));
+      }
       const parts = [`exit=${r.exit_code}`];
       if (r.stdout) parts.push(r.stdout.trimEnd());
       if (r.stderr) parts.push("[stderr] " + r.stderr.trimEnd());
-      if (r.error) parts.push("[error] " + r.error);
       return out(parts.join("\n"));
     }
   }));
 
-  // 6) 无障碍服务自检/自愈（手动触发；插件本身每 30 秒也会自动跑一次）
+  // 6) 无障碍手动自愈（不做开机保活）
   ctx.tools.register(defineTool({
     name: "ops_a11y_ensure",
-    description: "检查无障碍服务（屏幕助手）是否真的活着；不活就自动重新绑定。" +
-      "ColorOS 常杀掉无障碍进程但保留开关，此时 ops_ui_* 会报 ECONNREFUSED 127.0.0.1:3181。" +
-      "插件后台每 30 秒会自己检查一次，这个工具用来立即手动触发。",
+    description: "检查无障碍服务是否活着；不活就重新绑定。前提是当前有特权通道（Shizuku 或 root）——" +
+      "重启后 Shizuku 与临时 root 都会消失，本插件**不做开机自启/后台保活**。" +
+      "ColorOS/MIUI 常杀掉无障碍进程但保留开关，此时 ops_ui_* 会报 ECONNREFUSED 127.0.0.1:3181。",
     parameters: {},
     output: OUTPUT,
     async execute() {
       if (await a11yAlive()) return out("无障碍服务正常。");
-      const ok = await rebindA11y();
-      if (ok && (await a11yAlive())) return out("无障碍服务原本不可用，已自动重新绑定并恢复。");
-      return fail("无障碍服务不可用，自动重绑失败。请手动到 设置 → 无障碍 关闭再开启「DeepSeek Harness 屏幕助手」。");
+      const r = await rebindA11y();
+      if (r.ok && (await a11yAlive())) return out("无障碍服务原本不可用，已重新绑定并恢复。");
+      return fail(r.error || "自动重绑失败。请手动到 设置 → 无障碍 关闭再开启「DeepSeek Harness 屏幕助手」。");
     }
   }));
 
-  // 后台保活：每 30 秒探一次，连续 2 次失败才动手，60 秒冷却，避免抖动与惊群。
-  let failStreak = 0, busy = false, lastRebind = 0;
-  const timer = setInterval(async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      if (await a11yAlive()) { failStreak = 0; return; }
-      failStreak += 1;
-      if (failStreak < 2) return;
-      if (Date.now() - lastRebind < 60000) return;
-      lastRebind = Date.now();
-      if (await rebindA11y() && await a11yAlive()) failStreak = 0;
-    } catch (_) {
-      /* 保活失败不抛，静默重试 */
-    } finally {
-      busy = false;
+  // 7) 环境自检
+  ctx.tools.register(defineTool({
+    name: "ops_env",
+    description: "环境自检：一次报告四类环境 —— 命令行环境（node/shell/PATH）、权限环境（root 与 Shizuku 可用性）、" +
+      "工具环境（本插件与 dsh 可见工具）、系统环境（Android 版本/型号/安全补丁/SELinux/屏幕/无障碍/前台包名）。" +
+      "排查「为什么工具不可用」时先跑这个。",
+    parameters: {},
+    output: OUTPUT,
+    async execute() {
+      return out(await envReport());
     }
-  }, 30000);
-  if (timer && typeof timer.unref === "function") timer.unref();
-  if (typeof ctx.on === "function") {
-    try { ctx.on("dispose", () => clearInterval(timer)); } catch (_) {}
-  }
+  }));
+
+  // 说明：v2 移除了 v1 的 30s 后台保活定时器。
+  // 开机时 Shizuku 与临时 root 都不在，后台探活只会空转；自愈改为按需手动触发。
 }
 
-export { name, inject, apply };
+export { apply };

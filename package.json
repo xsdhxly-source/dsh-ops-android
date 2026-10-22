@@ -1,7 +1,7 @@
 {
   "name": "dsh-ops-android",
-  "version": "1.0.0",
-  "description": "Android 端「省 token 操作原语」：紧凑读屏(ops_ui_digest)、一步式查找+动作(ops_ui_find)、内置轮询等待(ops_ui_wait)、批量步骤(ops_ui_seq)、批量特权 shell(ops_shell)。为手机 UI 自动化消除多余往返与冗长输出。",
+  "version": "2.0.0",
+  "description": "Android 端「省 token 操作原语」v2：双状态特权通道（root 越狱态走自定义 su / shizuku 坐牢态走 /shell）、屏幕尺寸手动优先、环境自检(ops_env)，外加紧凑读屏(ops_ui_digest)、一步式查找+动作(ops_ui_find)、内置轮询等待(ops_ui_wait)、批量步骤(ops_ui_seq)。",
   "license": "MIT",
   "type": "module",
   "main": "index.js",
